@@ -14,13 +14,21 @@ async function zohoMappingMiddleware(req, res, next) {
       zoho.getDefaultExpenseAccountId(),
     ]);
 
-    const lineItems = (bill.lineItems?.length ? bill.lineItems : [{ description: 'Bill total', amount: bill.totalAmount }]).map(
-      (item) => ({
-        account_id: expenseAccountId,
-        name: (item.description || 'Line item').slice(0, 100),
-        description: item.description || '',
-        rate: item.unitPrice ?? item.amount ?? 0,
-        quantity: item.quantity ?? 1,
+    const rawItems = bill.lineItems?.length ? bill.lineItems : [{ description: 'Bill total', amount: bill.totalAmount }];
+    const lineItems = await Promise.all(
+      rawItems.map(async (item) => {
+        // rate is the PRE-tax unit price - Zoho applies tax_id on top of
+        // rate*quantity itself, so passing a tax-inclusive "amount" here
+        // instead would double up the tax in Zoho's computed total.
+        const taxId = await zoho.findTaxIdForRate(item.taxRate);
+        return {
+          account_id: expenseAccountId,
+          name: (item.description || 'Line item').slice(0, 100),
+          description: item.description || '',
+          rate: item.unitPrice ?? item.amount ?? 0,
+          quantity: item.quantity ?? 1,
+          ...(taxId ? { tax_id: taxId } : {}),
+        };
       })
     );
 

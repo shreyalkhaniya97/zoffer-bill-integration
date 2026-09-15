@@ -6,6 +6,7 @@ const ORG_ID = process.env.ZOHO_ORG_ID;
 
 let cachedToken = null; // { accessToken, expiresAt }
 let cachedExpenseAccountId = null;
+let cachedTaxes = null; // [{ tax_id, tax_percentage, ... }]
 
 async function getAccessToken() {
   if (cachedToken && cachedToken.expiresAt > Date.now()) return cachedToken.accessToken;
@@ -78,9 +79,25 @@ async function getDefaultExpenseAccountId() {
   return cachedExpenseAccountId;
 }
 
+// Zoho line items need a real tax_id (a tax rate configured in the org's own
+// Settings -> Taxes), not a raw percentage - without this the bill total is
+// silently computed pre-tax, which doesn't match the invoice's stated total.
+// Returns null (no tax applied) rather than guessing if there's no match -
+// wrong tax mapping is worse than none, since it'd misstate the return filed.
+async function findTaxIdForRate(ratePercent) {
+  if (ratePercent == null) return null;
+
+  if (!cachedTaxes) {
+    const { taxes } = await zohoRequest('GET', '/settings/taxes');
+    cachedTaxes = taxes || [];
+  }
+  const match = cachedTaxes.find((t) => Math.abs(t.tax_percentage - ratePercent) < 0.01);
+  return match ? match.tax_id : null;
+}
+
 async function createBill(payload) {
   const result = await zohoRequest('POST', '/bills', { data: payload });
   return result.bill;
 }
 
-module.exports = { findOrCreateVendor, getDefaultExpenseAccountId, createBill };
+module.exports = { findOrCreateVendor, getDefaultExpenseAccountId, findTaxIdForRate, createBill };

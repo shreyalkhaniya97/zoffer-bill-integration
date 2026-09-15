@@ -14,8 +14,22 @@ function toNumber(value) {
   return Number.isFinite(num) ? num : null;
 }
 
+// Vision models on a busy table can re-read the last row instead of the real
+// next one, producing an exact duplicate line item. That's silently wrong
+// once it reaches Zoho, which sums quantity*rate per line for the bill total -
+// it never sees our totalAmount field at all. Drop exact repeats.
+function dedupeLineItems(items) {
+  const seen = new Set();
+  return items.filter((item) => {
+    const key = `${item.quantity}|${item.unitPrice}|${item.amount}`;
+    if (seen.has(key) && item.quantity != null) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function normalizeExtraction(extracted) {
-  const lineItems = (extracted.lineItems || []).map((item) => {
+  let lineItems = (extracted.lineItems || []).map((item) => {
     const quantity = toNumber(item.quantity);
     const unitPrice = toNumber(item.unitPrice);
     const taxRate = toNumber(item.taxRate);
@@ -25,6 +39,7 @@ function normalizeExtraction(extracted) {
     }
     return { ...item, quantity, unitPrice, taxRate, amount };
   });
+  lineItems = dedupeLineItems(lineItems);
 
   let totalAmount = toNumber(extracted.totalAmount);
   if (totalAmount == null && lineItems.some((i) => i.amount != null)) {
