@@ -1,0 +1,10 @@
+node_modules/
+.env
+uploads/*
+!uploads/.gitkeep
+*.log
+
+# Real bank/GST details in these attachments - not for a public repo.
+# Drop your own copies of the assignment's test bills here locally to test.
+test-bills/*
+!test-bills/.gitkeep

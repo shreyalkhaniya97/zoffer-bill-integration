@@ -1,0 +1,21 @@
+{
+  "name": "zoffer-bill-integration",
+  "version": "1.0.0",
+  "description": "Postman -> server -> extract -> Zoho Books integration prototype",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "file-type": "^16.5.4",
+    "mongoose": "^8.9.5",
+    "multer": "^1.4.5-lts.1",
+    "pdf-parse": "^1.1.1",
+    "pdf-to-img": "^4.4.0"
+  }
+}
