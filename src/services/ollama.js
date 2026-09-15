@@ -26,7 +26,12 @@ use the nearby label text to decide which number is which - never assume positio
 A single item's description may wrap across several consecutive lines before that item's
 price/qty/tax/total figures appear together, often several lines later or on their own line -
 merge wrapped description lines into ONE line item, do not create a separate line item just
-because a product code or part of a long description sits on its own line.`;
+because a product code or part of a long description sits on its own line.
+
+Some invoices state tax ONCE for the whole bill (e.g. "IGST @ 18%" near the taxable value/
+total, with no per-line tax column) rather than per line item. When that's the case, leave
+every line item's "taxRate" null and put that percentage in the top-level "overallTaxRate"
+field instead - do not guess a per-line rate that isn't actually printed next to that line.`;
 
 // Constrains Ollama's structured-output decoding so numeric fields cannot come
 // back as strings (e.g. "8%") - stronger than relying on prompt wording alone.
@@ -52,8 +57,9 @@ const EXTRACTION_SCHEMA = {
       },
     },
     totalAmount: { type: ['number', 'null'] },
+    overallTaxRate: { type: ['number', 'null'] },
   },
-  required: ['vendorName', 'invoiceNumber', 'invoiceDate', 'lineItems', 'totalAmount'],
+  required: ['vendorName', 'invoiceNumber', 'invoiceDate', 'lineItems', 'totalAmount', 'overallTaxRate'],
 };
 
 function stripJsonFences(text) {

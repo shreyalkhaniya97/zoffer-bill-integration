@@ -45,8 +45,9 @@ function normalizeExtraction(extracted) {
   if (totalAmount == null && lineItems.some((i) => i.amount != null)) {
     totalAmount = Math.round(lineItems.reduce((sum, i) => sum + (i.amount || 0), 0) * 100) / 100;
   }
+  const overallTaxRate = toNumber(extracted.overallTaxRate);
 
-  return { ...extracted, lineItems, totalAmount };
+  return { ...extracted, lineItems, totalAmount, overallTaxRate };
 }
 
 // pdf-parse concatenates all text in document order, which flattens table

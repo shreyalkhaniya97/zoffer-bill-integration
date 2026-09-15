@@ -20,7 +20,10 @@ async function zohoMappingMiddleware(req, res, next) {
         // rate is the PRE-tax unit price - Zoho applies tax_id on top of
         // rate*quantity itself, so passing a tax-inclusive "amount" here
         // instead would double up the tax in Zoho's computed total.
-        const taxId = await zoho.findTaxIdForRate(item.taxRate);
+        // Fall back to the whole-bill tax rate when this line has none of
+        // its own - common on invoices that state tax once near the total
+        // rather than per line item (see ollama.js EXTRACTION_INSTRUCTIONS).
+        const taxId = await zoho.findTaxIdForRate(item.taxRate ?? bill.overallTaxRate);
         return {
           account_id: expenseAccountId,
           name: (item.description || 'Line item').slice(0, 100),
