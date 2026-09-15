@@ -78,6 +78,8 @@ Server starts on `http://localhost:3000`, connects to Mongo, and builds the RAG 
 4. Run `node scripts/exchangeZohoToken.js <THE_CODE>` — it exchanges the code for a long-lived refresh token and prints the `.env` line to add.
 5. Fill in `ZOHO_CLIENT_ID`, `ZOHO_CLIENT_SECRET`, `ZOHO_REFRESH_TOKEN`, `ZOHO_ORG_ID` in `.env`.
 
+> **Data center gotcha:** every Zoho account is pinned to one regional data center at signup (`.com` for US, `.in` for India, `.eu`, `.com.au`, ...), and the token endpoint must match it exactly - the wrong one returns `invalid_client` even with perfectly correct credentials, which looks identical to a genuinely bad client secret. Mine turned out to be on `.com` despite testing from India. If you hit `invalid_client`, don't assume the secret is wrong - check `ZOHO_ACCOUNTS_URL`/`ZOHO_API_DOMAIN` against your account's actual DC first (visible in the URL bar when logged into Zoho Books).
+
 ## API
 
 - `POST /bills` — the real workflow: upload → extract → RAG check → post to Zoho Books → save to Mongo.
@@ -93,32 +95,35 @@ curl -s -X POST http://localhost:3000/bills \
 
 ## Real test results
 
-**Amazon PDF (digital text, ~21s):**
+Both bills below were run through the real `/bills` endpoint end-to-end, including the actual Zoho Books sync (not just extraction).
+
+**Amazon PDF (digital text, ~20s) — fully correct, synced to Zoho:**
 ```json
 {
-  "vendorName": "DEFTECH & GREENINDIA PRIVATE LIMITED",
+  "vendorName": "Moxcel Store",
   "invoiceNumber": "ZNGG-20929",
-  "lineItems": [{ "description": "Catchex Stainless Steel Wax Carving Tools...", "hsnCode": "8205", "taxRate": 8, "amount": 417.78 }],
+  "invoiceDate": "30.11.2024",
+  "lineItems": [{ "description": "Catchex Stainless Steel Wax Carving Tools Double Ended", "hsnCode": "8205", "quantity": 1, "unitPrice": 354.05, "taxRate": 18, "amount": 417.78 }],
   "totalAmount": 417.78
 }
 ```
-Clean, accurate extraction — no OCR needed, `pdf-parse` reads the real text layer directly.
+Every field correct, including the tax rate (18%) — an earlier version of this pipeline misread it as 8% because plain `pdf-parse` flattens table columns into one text stream with no marker for which number belongs to which column. Fixed with a custom `pagerender` hook that reconstructs rows/columns from each text fragment's real x/y position on the page (see [extraction.js](src/services/extraction.js)) before handing text to the LLM — a layout fix, not an OCR fix, since the underlying character extraction was never wrong.
 
-**Handwritten GST invoice (vision model, ~85s):**
+**Handwritten GST invoice (vision model, ~90-120s) — synced to Zoho, extraction imperfect:**
 ```json
 {
   "vendorName": "R.J.I. ENGG. WORKS",
   "invoiceNumber": "611",
   "invoiceDate": "24-12-24",
   "lineItems": [
-    { "description": "Moulding Body Tag", "hsnCode": "3923", "quantity": 545, "unitPrice": 6, "amount": 3270 },
-    { "description": "Body Tag Base", "hsnCode": "3923", "quantity": 535, "unitPrice": 2.5, "amount": 1338 },
-    { "description": "Body Tag Button", "hsnCode": "3923", "quantity": 520, "unitPrice": 6.5, "amount": 3380 }
+    { "description": "Moulding Body Tag", "hsnCode": "3923", "quantity": 545, "unitPrice": 6, "taxRate": null, "amount": 3270 },
+    { "description": "Body Tag Base", "hsnCode": "3923", "quantity": 535, "unitPrice": 2.5, "taxRate": null, "amount": 1338 },
+    { "description": "Body Tag Button", "hsnCode": "3923", "quantity": 520, "unitPrice": 6.5, "taxRate": null, "amount": 3380 }
   ],
   "totalAmount": 9426
 }
 ```
-Vendor, invoice number, date, HSN code, and total all match the source exactly. See [Known limitations](#known-limitations) for the two things it gets wrong.
+Vendor, invoice number, date, HSN code, and total all match the source exactly. `taxRate: null` on each line is correct behavior, not a miss — the source invoice only states IGST 18% once for the whole bill, not per line item, and the model is (correctly) not inventing a per-line figure it wasn't given. See [Known limitations](#known-limitations) for what it still gets wrong on this specific invoice.
 
 ## Security guardrails applied
 
@@ -134,7 +139,7 @@ Deliberately scoped out for a 3-day scrappy prototype — listed here instead of
 
 - **No auth on `/bills`.** Fine for local Postman testing; would need an API key/JWT check before this ever sits behind a public URL.
 - **No human-review gate before posting to Zoho.** The biggest one. Right now extraction → Zoho is fully automatic. A real product handling real money should hold bills in a `pending_review` state, at least until extraction accuracy is proven over time — the RAG middleware's flags are a start toward that, not a replacement for it.
-- **Handwritten-invoice line-item labels can shift by one row** when a table has a header + indented sub-items (as in the test invoice). The *numbers* (qty/rate/amount/total) came out exactly correct in testing; the *description* assigned to each row can be off by one position. Worth a layout-aware prompt refinement, not attempted here given the time box.
+- **Handwritten-invoice line items can be mislabeled or duplicated** on a busy table with a header + indented sub-items (as in the test invoice) — across test runs this showed up as descriptions shifted by one row, or occasionally the last row duplicated instead of reading the real fourth item. `totalAmount` was correct every time (read directly off the invoice's stated grand total), but the line-item *breakdown* on this specific invoice is the one place I'd want a human glance before trusting it, which is exactly the review-gate point above.
 - **GST knowledge base is 12 hand-picked HSN entries**, not the full CBIC master list (thousands of codes, and it changes via periodic government notifications). Good enough to demonstrate the RAG-flagging mechanism; not production tax-compliance data.
 - **Single-page bills only.** Multi-page scanned bills would need per-page vision calls plus a stitching step to merge line items — not built.
 - **Single hardcoded tenant** (`DEFAULT_ORG_ID`). `Bill.orgId` and the (currently unused) `Organization` model are the intended extension points for real multi-tenant auth.

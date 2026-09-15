@@ -18,8 +18,15 @@ amounts, unless the bill states a different total explicitly.
 Field meanings, do not confuse these:
 - "taxRate" is a tax PERCENTAGE (e.g. GST/IGST rate) - always a small number, typically 0-30.
 - "amount" and "totalAmount" are MONEY VALUES - typically much larger than taxRate.
+- "hsnCode" is numeric (e.g. "8205"), often on its own line labeled "HSN:". A code that mixes
+  letters and digits (e.g. "B0921N4SZB") is a product/ASIN code, not an hsnCode - put it in
+  the description instead, never in hsnCode.
 If the source text is a flattened table (numbers not clearly aligned to column headers),
-use the nearby label text to decide which number is which - never assume position/order.`;
+use the nearby label text to decide which number is which - never assume position/order.
+A single item's description may wrap across several consecutive lines before that item's
+price/qty/tax/total figures appear together, often several lines later or on their own line -
+merge wrapped description lines into ONE line item, do not create a separate line item just
+because a product code or part of a long description sits on its own line.`;
 
 // Constrains Ollama's structured-output decoding so numeric fields cannot come
 // back as strings (e.g. "8%") - stronger than relying on prompt wording alone.
@@ -71,7 +78,9 @@ function parseModelJson(raw) {
 async function extractFromText(rawText) {
   const { data } = await client.post('/api/generate', {
     model: TEXT_MODEL,
-    prompt: `${EXTRACTION_INSTRUCTIONS}\n\nBill text:\n${rawText}`,
+    prompt: `${EXTRACTION_INSTRUCTIONS}\n\nBill text below is laid out one PDF line per text line, with "|" ` +
+      `separating fragments that sit in different columns on that same line (reconstructed from the PDF's ` +
+      `actual layout) - use these groupings to tell which numbers belong to which row/label.\n\n${rawText}`,
     format: EXTRACTION_SCHEMA,
     options: { temperature: 0 },
     stream: false,

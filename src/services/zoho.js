@@ -19,6 +19,13 @@ async function getAccessToken() {
     },
   });
 
+  // Zoho's token endpoint can return 200 with an { error: "..." } body instead
+  // of a non-2xx status - without this check a bad refresh/client secret fails
+  // silently and every downstream call gets "Authorization: Zoho-oauthtoken undefined".
+  if (!data.access_token) {
+    throw new Error(`Zoho token refresh failed: ${data.error || JSON.stringify(data)}`);
+  }
+
   cachedToken = {
     accessToken: data.access_token,
     expiresAt: Date.now() + (data.expires_in - 60) * 1000,
