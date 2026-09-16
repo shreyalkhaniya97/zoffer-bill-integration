@@ -100,4 +100,35 @@ async function createBill(payload) {
   return result.bill;
 }
 
-module.exports = { findOrCreateVendor, getDefaultExpenseAccountId, findTaxIdForRate, createBill };
+// Tax application can fail for reasons that have nothing to do with our data
+// being wrong (e.g. GST not enabled at the org level - an account-config
+// step, not an extraction or mapping bug). Rather than fail the whole
+// workflow over an org setting, retry once with tax stripped so the bill
+// still gets logged - which is the actual assignment requirement - with a
+// clear note attached about what was dropped and why.
+async function createBillWithFallback(payload) {
+  try {
+    const bill = await createBill(payload);
+    return { bill, taxDropped: false };
+  } catch (err) {
+    const message = err.response?.data?.message || err.message;
+    const hasTax = payload.line_items.some((i) => i.tax_id);
+    if (!hasTax) throw err;
+
+    console.warn(`[zoho] createBill failed with tax applied (${message}), retrying without tax`);
+    const strippedPayload = {
+      ...payload,
+      line_items: payload.line_items.map(({ tax_id, ...rest }) => rest),
+    };
+    const bill = await createBill(strippedPayload);
+    return { bill, taxDropped: true, taxDropReason: message };
+  }
+}
+
+module.exports = {
+  findOrCreateVendor,
+  getDefaultExpenseAccountId,
+  findTaxIdForRate,
+  createBill,
+  createBillWithFallback,
+};

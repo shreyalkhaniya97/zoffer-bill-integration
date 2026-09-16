@@ -1,5 +1,6 @@
 const pdfParse = require('pdf-parse');
 const ollama = require('./ollama');
+const parseConversionTools = require('./parseConversionTools');
 
 const TEXT_LENGTH_THRESHOLD = 50; // below this, treat the PDF as scanned (no real text layer)
 
@@ -93,7 +94,7 @@ async function renderFirstPdfPageToBase64(buffer) {
  * Figures out image vs digital-PDF vs scanned-PDF, runs the matching Ollama
  * extraction, and returns a uniform result shape.
  */
-async function extractBillData(file) {
+async function extractBillDataOllama(file) {
   const isImage = file.mimetype.startsWith('image/');
 
   if (isImage) {
@@ -117,6 +118,23 @@ async function extractBillData(file) {
   }
 
   throw new Error(`Unsupported file type: ${file.mimetype}`);
+}
+
+// Parse's API takes the raw file directly and handles PDF-vs-image, table
+// layout, and OCR all server-side - no need for our own branching/layout-
+// reconstruction logic on this path.
+async function extractBillDataParse(file) {
+  const result = await parseConversionTools.extractBillData(file);
+  return { ...result, extracted: normalizeExtraction(result.extracted) };
+}
+
+// EXTRACTION_PROVIDER lets the pipeline swap between the fully-local Ollama
+// path and the hosted Parse API without ripping either one out - see README
+// for the accuracy/speed/privacy trade-off between them.
+async function extractBillData(file) {
+  const provider = process.env.EXTRACTION_PROVIDER || 'ollama';
+  if (provider === 'parse') return extractBillDataParse(file);
+  return extractBillDataOllama(file);
 }
 
 module.exports = { extractBillData };

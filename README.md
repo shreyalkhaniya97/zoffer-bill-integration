@@ -3,17 +3,19 @@
 A scrappy but functionally complete prototype of the required workflow:
 **Postman upload → server receives file → extracts bill data → maps to Zoho Books format → posts to Zoho Books.**
 
-Built fully local: Ollama for LLM extraction (no OpenAI/cloud LLM calls), MongoDB for storage, Node/Express for the server.
+Node/Express server, MongoDB for storage, and a **switchable extraction provider** — either fully local (Ollama) or a hosted document-extraction API (Parse by conversiontools.io) — see [Extraction providers](#extraction-providers) for why both exist and the real trade-off between them.
 
 ## Why this stack
 
 | Choice | Reasoning |
 |---|---|
-| **Ollama (local LLMs)**, not a cloud LLM API | Zero per-call cost while iterating, no invoice data leaving the machine (a real point in fintech accounting software's favor), and it's what I already had GPU headroom for (RTX 3060, 6GB VRAM). |
+| **Ollama (local LLMs)** as the default extraction provider | Zero per-call cost while iterating, no invoice data leaving the machine (a real point in fintech accounting software's favor), and it's what I already had GPU headroom for (RTX 3060, 6GB VRAM). Kept as the default even after adding a hosted alternative (below) — see [Extraction providers](#extraction-providers). |
 | **Two different Ollama models**, not one for everything | A digital PDF (Amazon's) has a real text layer — a small, fast text model (`llama3.2:3b`) is enough and ~4x faster than routing everything through a vision model. A handwritten scan needs an actual vision-capable model. Using one model for both would either waste vision-model latency on easy cases or starve the hard case of a model that can actually read an image. |
 | **`qwen2.5vl:7b`** over `llava:7b` for the vision path | Tried `llava` first — it hallucinated a completely different invoice (fabricated line items like "car washing" that don't exist in the source). Swapped to `qwen2.5vl`, which is specifically stronger at document/text-in-image OCR, and it correctly read vendor name, invoice number, date, HSN code, and total exactly on the real handwritten test invoice. Documented under [Known limitations](#known-limitations) below — it's not perfect, but it's the one that actually reads the bill instead of inventing one. |
+| **A pluggable Parse (conversiontools.io) provider**, switchable via `EXTRACTION_PROVIDER` | Evaluated it as a purpose-built alternative to a general-purpose vision-LLM. It's measurably more accurate and 3-6x faster (see [Extraction providers](#extraction-providers)) — but it's a paid external service that receives real invoice data, which breaks the "everything stays local" property Ollama gives for free. Wired in as a swap-in-and-out option rather than a replacement, so the trade-off is a runtime choice, not a rewrite. |
 | **MongoDB**, matching the requested stack | Stores the raw extraction + mapped Zoho payload per bill as an audit trail, independent of whether the Zoho sync succeeds — useful for debugging a bad extraction without needing to re-run the (slow) LLM call. |
-| **RAG as Express middleware**, not a separate service | Sits between extraction and Zoho-mapping in the request pipeline (`extractionMiddleware → ragMiddleware → zohoMappingMiddleware`). Cross-checks each line item's extracted GST rate against a small local knowledge base of HSN codes/rates (embedded with `nomic-embed-text`, compared via in-memory cosine similarity — no separate vector DB needed at this scale). It only **flags** mismatches for human review; it never silently "corrects" a number. |
+| **RAG as Express middleware**, not a separate service | Sits between extraction and Zoho-mapping in the request pipeline (`extractionMiddleware → ragMiddleware → zohoMappingMiddleware`). Cross-checks each line item's extracted GST rate against a small local knowledge base of HSN codes/rates (embedded with `nomic-embed-text`, compared via in-memory cosine similarity — no separate vector DB needed at this scale). It only **flags** mismatches for human review; it never silently "corrects" a number. Runs regardless of which extraction provider produced the data. |
+| **Graceful tax fallback in `zoho.js`**, not a hard failure | If Zoho rejects a bill because tax isn't applicable (e.g. GST not enabled at the org level — an account-config issue, not a data problem), the code retries once with tax stripped rather than failing the whole request. The response still tells the truth about what happened via a `note` field — this isn't hiding the gap, it's refusing to let an unrelated account setting block the one thing the assignment actually asks for: the bill gets logged into Zoho Books. |
 | **No auth on the endpoint** | Deliberate scope call for a local-only scrappy demo, not an oversight — see [Known limitations](#known-limitations). |
 
 ## Architecture
@@ -27,26 +29,37 @@ multer (memory storage, 15MB cap)
    ▼
 extractionMiddleware
    │  1. file-type sniffs real bytes (never trusts client Content-Type)
-   │  2. routes by actual content:
-   │       image/*          ─────────────► Ollama vision (qwen2.5vl)
-   │       pdf, has text layer ──────────► pdf-parse → Ollama text (llama3.2:3b)
-   │       pdf, no text layer (scanned) ─► pdf-to-img → Ollama vision (qwen2.5vl)
+   │  2. hands off to whichever provider EXTRACTION_PROVIDER selects:
+   │
+   │     ollama (default, fully local)          parse (hosted, opt-in)
+   │     ───────────────────────────            ─────────────────────
+   │     image ──────────► Ollama vision         any file type sent as-is to
+   │       (qwen2.5vl)                           conversiontools.io's /extract
+   │     pdf w/ text ────► pdf-parse (layout-    API with a custom schema_id -
+   │       aware) → Ollama text (llama3.2:3b)    it handles PDF-vs-image, table
+   │     pdf, scanned ───► pdf-to-img →           layout, and OCR server-side.
+   │       Ollama vision (qwen2.5vl)             Response normalized into the
+   │                                              same shape as the Ollama path.
    ▼
 ragMiddleware
-   │  embeds each line item's description (nomic-embed-text)
+   │  embeds each line item's description (nomic-embed-text, always local)
    │  compares against a small local GST/HSN knowledge base
    │  attaches ragFlags[] for rate mismatches - advisory only, never blocks
    ▼
 zohoMappingMiddleware
    │  finds/creates the vendor as a Zoho contact
-   │  looks up a default expense account from the chart of accounts
+   │  looks up a default expense account + a matching tax_id from Zoho's
+   │  own configured tax rates (falls back to the bill-level tax rate if a
+   │  line item doesn't state its own - see overallTaxRate)
    │  builds the Zoho Books bill payload
    ▼
 route handler
-   │  POST to Zoho Books API
+   │  POST to Zoho Books API - if that fails specifically because tax
+   │  couldn't be applied, retries once with tax stripped rather than
+   │  failing the whole request (see zoho.createBillWithFallback)
    │  saves Bill document to Mongo (status: synced/failed either way)
    ▼
-Response to Postman (extraction + ragFlags + zohoBillId, or the error)
+Response to Postman (extraction + ragFlags + zohoBillId, + a note if tax was dropped)
 ```
 
 ## Setup
@@ -58,11 +71,11 @@ npm install
 
 ollama pull llama3.2:3b
 ollama pull qwen2.5vl:7b
-ollama pull nomic-embed-text
+ollama pull nomic-embed-text   # always needed - the RAG check uses this regardless of provider
 ollama serve   # if not already running as a background service
 ```
 
-Copy `.env.example` to `.env` and fill in the Zoho block (see below). Then:
+Copy `.env.example` to `.env` and fill in the Zoho block (see below). `EXTRACTION_PROVIDER` defaults to `ollama` - no extra setup needed for the fully-local path. To try the hosted path instead, set `EXTRACTION_PROVIDER=parse` and fill in `PARSE_API_KEY` (get one at [parse.conversiontools.io](https://parse.conversiontools.io)) and optionally `PARSE_SCHEMA_ID` if you've defined a custom extraction schema in their dashboard.
 
 ```bash
 node server.js
@@ -80,9 +93,23 @@ Server starts on `http://localhost:3000`, connects to Mongo, and builds the RAG 
 
 > **Data center gotcha:** every Zoho account is pinned to one regional data center at signup (`.com` for US, `.in` for India, `.eu`, `.com.au`, ...), and the token endpoint must match it exactly - the wrong one returns `invalid_client` even with perfectly correct credentials, which looks identical to a genuinely bad client secret. Mine turned out to be on `.com` despite testing from India. If you hit `invalid_client`, don't assume the secret is wrong - check `ZOHO_ACCOUNTS_URL`/`ZOHO_API_DOMAIN` against your account's actual DC first (visible in the URL bar when logged into Zoho Books).
 
+## Extraction providers
+
+Two interchangeable ways to turn a bill into structured data, switched with `EXTRACTION_PROVIDER` in `.env`:
+
+| | `ollama` (default) | `parse` |
+|---|---|---|
+| Where it runs | Fully local (your GPU) | Hosted API (conversiontools.io) |
+| Data leaves the machine? | No | Yes - including any bank details visible on the document |
+| Cost | Free | Free tier (30 pages/mo), then paid |
+| Amazon PDF (digital text) | ~20-40s, all fields correct but description gets truncated and no tax *amount* is captured (only rate) | ~20-25s, every field exact including the full description and tax amount |
+| Handwritten invoice (vision) | ~90-120s, vendor/dates/total reliably correct, line-item labels/count vary run to run | ~20-25s, same reliability on vendor/dates/totals, one similar line-item labeling artifact |
+
+Both were evaluated on the same two real test bills - see the raw outputs in git history / `scripts/testParseConversionTools.js`. Parse wins on speed and a couple of fields (full description, tax amount) on this small sample; Ollama's advantage is architectural, not accuracy: nothing about the document ever leaves the machine. I kept both rather than pick one, since which trade-off is right depends on whether Zoffer's actual customers would accept invoice data (some of it as sensitive as bank account numbers) going to a third-party API - a product decision, not a technical one, so the code shouldn't force it.
+
 ## API
 
-- `POST /bills` — the real workflow: upload → extract → RAG check → post to Zoho Books → save to Mongo.
+- `POST /bills` — the real workflow: upload → extract (via whichever provider is configured) → RAG check → post to Zoho Books → save to Mongo.
 - `POST /bills/extract-only` — dev/testing endpoint: runs extraction + the RAG check but skips Zoho entirely. Useful for validating the AI pipeline without needing Zoho credentials wired up yet.
 - `GET /health` — liveness check.
 
@@ -130,8 +157,9 @@ Vendor, invoice number, date, HSN code, and total all match the source exactly. 
 - **Real file-type sniffing** (`file-type` package reads actual bytes) instead of trusting the client-supplied `Content-Type` — blocks disguised/mislabeled uploads.
 - **15MB upload cap** on multer — prevents a memory-exhaustion DoS via oversized uploads.
 - **MongoDB bound to `127.0.0.1` only**, never `0.0.0.0` — the DB holds GST numbers and vendor financial details.
-- **Zoho refresh token** lives only in `.env` (gitignored), never logged or echoed back in any API response.
+- **Zoho refresh token and Parse API key** live only in `.env` (gitignored), never logged or echoed back in any API response.
 - Mapped bill payload and raw extraction are stored in Mongo regardless of Zoho sync outcome, so a failed sync is debuggable without re-running the (slow) LLM call.
+- **Duplicate bill numbers are rejected by Zoho, not silently overwritten.** Resubmitting the exact same invoice for the same vendor fails loudly rather than creating a second copy or clobbering the first - correct behavior for financial records, even though it means testing with the same file twice needs the earlier bill deleted first.
 
 ## Known limitations
 
@@ -139,7 +167,8 @@ Deliberately scoped out for a 3-day scrappy prototype — listed here instead of
 
 - **No auth on `/bills`.** Fine for local Postman testing; would need an API key/JWT check before this ever sits behind a public URL.
 - **No human-review gate before posting to Zoho.** The biggest one. Right now extraction → Zoho is fully automatic. A real product handling real money should hold bills in a `pending_review` state, at least until extraction accuracy is proven over time — the RAG middleware's flags are a start toward that, not a replacement for it.
-- **Handwritten-invoice line items can be mislabeled or duplicated** on a busy table with a header + indented sub-items (as in the test invoice) — across test runs this showed up as descriptions shifted by one row, or occasionally the last row duplicated instead of reading the real fourth item. `totalAmount` was correct every time (read directly off the invoice's stated grand total), but the line-item *breakdown* on this specific invoice is the one place I'd want a human glance before trusting it, which is exactly the review-gate point above.
+- **Handwritten-invoice line items can be mislabeled or duplicated** on a busy table with a header + indented sub-items (as in the test invoice) — happens on both extraction providers, not just one, which suggests it's the source document's layout that's genuinely ambiguous (a category header row sitting directly above its sub-items), not a single model's flaw. `totalAmount` was correct every time (read directly off the invoice's stated grand total), but the line-item *breakdown* on this specific invoice is the one place I'd want a human glance before trusting it, which is exactly the review-gate point above.
+- **Tax can silently fail to apply, on purpose.** `zoho.createBillWithFallback` retries without tax if Zoho rejects it (e.g. GST not enabled at the org level) rather than failing the whole request - the response still says so via a `note` field, but if that note gets ignored downstream, a bill could post short of its real total. This trades "never blocks on an account-config issue" for "requires reading the note" - the right call for a demo/prototype, worth a harder failure mode once this is wired to a real accounting workflow.
 - **GST knowledge base is 12 hand-picked HSN entries**, not the full CBIC master list (thousands of codes, and it changes via periodic government notifications). Good enough to demonstrate the RAG-flagging mechanism; not production tax-compliance data.
 - **Single-page bills only.** Multi-page scanned bills would need per-page vision calls plus a stitching step to merge line items — not built.
 - **Single hardcoded tenant** (`DEFAULT_ORG_ID`). `Bill.orgId` and the (currently unused) `Organization` model are the intended extension points for real multi-tenant auth.
@@ -155,12 +184,14 @@ src/middleware/
   ragMiddleware.js                 GST rate cross-check, advisory flags only
   zohoMappingMiddleware.js         vendor lookup/create, builds Zoho payload
 src/services/
-  extraction.js                    image vs digital-PDF vs scanned-PDF routing
+  extraction.js                    picks EXTRACTION_PROVIDER, image vs digital-PDF vs scanned-PDF routing for the Ollama path
   ollama.js                        text/vision/embedding calls to local Ollama
-  zoho.js                          Zoho OAuth token, contacts, chart of accounts, bills
+  parseConversionTools.js          hosted-API alternative extraction provider, normalizes to the same shape as ollama.js
+  zoho.js                          Zoho OAuth token, contacts, chart of accounts, tax lookup, bills (incl. graceful tax fallback)
 src/rag/
   gstKnowledge.js                  the small HSN/rate knowledge base
   vectorStore.js                   embeds it once at boot, cosine-similarity lookup
 src/models/Bill.js                 Mongo schema - one document per processed bill
 scripts/exchangeZohoToken.js       one-time OAuth code → refresh token helper
+scripts/testParseConversionTools.js  standalone accuracy/speed comparison script, not part of the request pipeline
 ```

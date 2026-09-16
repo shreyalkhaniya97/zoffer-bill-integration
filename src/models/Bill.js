@@ -17,7 +17,7 @@ const BillSchema = new mongoose.Schema(
     orgId: { type: String, required: true, index: true },
     sourceFileName: String,
     sourceFileType: { type: String, enum: ['image', 'pdf-text', 'pdf-scanned'] },
-    extractionMethod: { type: String, enum: ['ollama-vision', 'ollama-text'] },
+    extractionMethod: { type: String, enum: ['ollama-vision', 'ollama-text', 'parse-conversiontools'] },
 
     rawExtractedJson: mongoose.Schema.Types.Mixed,
     lineItems: [LineItemSchema],

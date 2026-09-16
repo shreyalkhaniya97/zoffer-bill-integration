@@ -46,30 +46,50 @@ router.post(
       status: 'mapped',
     });
 
+    let zohoBill;
+    let taxDropped = false;
+    let taxDropReason;
     try {
-      const zohoBill = await zoho.createBill(req.zohoPayload);
+      const result = await zoho.createBillWithFallback(req.zohoPayload);
+      zohoBill = result.bill;
+      taxDropped = result.taxDropped;
+      taxDropReason = result.taxDropReason;
       billDoc.zohoBillId = zohoBill.bill_id;
       billDoc.status = 'synced';
-      await billDoc.save();
+      if (taxDropped) billDoc.errorMessage = `Posted without tax - ${taxDropReason}`;
+    } catch (err) {
+      billDoc.status = 'failed';
+      billDoc.errorMessage = err.response?.data?.message || err.message;
+      console.error('[zoho] createBill failed:', billDoc.errorMessage);
+    }
 
+    // A Mongo save failure (e.g. a schema validation error) must never crash
+    // the process or swallow the Zoho outcome above - log it and still
+    // respond with whatever we know, rather than leaving the request hanging
+    // into an unhandled rejection.
+    try {
+      await billDoc.save();
+    } catch (saveErr) {
+      console.error('[mongo] failed to save Bill document:', saveErr.message);
+    }
+
+    if (zohoBill) {
       return res.status(201).json({
-        message: 'Bill extracted and logged to Zoho Books.',
+        message: taxDropped
+          ? 'Bill extracted and logged to Zoho Books (posted without tax - see note).'
+          : 'Bill extracted and logged to Zoho Books.',
         billId: billDoc._id,
         zohoBillId: zohoBill.bill_id,
         extraction: extracted,
         ragFlags: extracted.ragFlags,
-      });
-    } catch (err) {
-      billDoc.status = 'failed';
-      billDoc.errorMessage = err.response?.data?.message || err.message;
-      await billDoc.save();
-      console.error('[zoho] createBill failed:', billDoc.errorMessage);
-      return res.status(502).json({
-        error: `Zoho Books sync failed: ${billDoc.errorMessage}`,
-        billId: billDoc._id,
-        extraction: extracted,
+        ...(taxDropped ? { note: `Tax could not be applied and was dropped: ${taxDropReason}` } : {}),
       });
     }
+    return res.status(502).json({
+      error: `Zoho Books sync failed: ${billDoc.errorMessage}`,
+      billId: billDoc._id,
+      extraction: extracted,
+    });
   }
 );
 
